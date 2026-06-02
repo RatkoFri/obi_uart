@@ -1,0 +1,5 @@
+*.out
+*.vcd
+*.json
+OBI_slave_uart_tb.sv
+simulate.sh
