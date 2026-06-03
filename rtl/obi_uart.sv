@@ -1,4 +1,4 @@
-module obi_uart_v2 #(
+module obi_uart #(
     parameter integer ADDR_WIDTH = 32,
     parameter integer DATA_WIDTH = 32
 ) (
