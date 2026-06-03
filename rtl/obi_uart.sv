@@ -1,4 +1,4 @@
-module obi_uart #(
+module obi_uart_v2 #(
     parameter integer ADDR_WIDTH = 32,
     parameter integer DATA_WIDTH = 32
 ) (
@@ -54,7 +54,7 @@ module obi_uart #(
 
     // Read interface signals
     logic rd_en;
-
+    logic [DATA_WIDTH-1:0] read_data_mux_out;
 
     // BEGIN: OBI wrapper
     register  #(
@@ -96,9 +96,9 @@ module obi_uart #(
 
     // BEGIN: OBI write interface
     
-    assign wr_en[0] = state == RESP & obi_awe_i & (obi_aaddr_i[6:0] == UartConfRegOffset); // Needs to ensure write request is valid and handshake occured in address phase
-    assign wr_en[1] = state == RESP & obi_awe_i & (obi_aaddr_i[6:0] == UartSpeedRegOffset); // Write enable for compare low register
-    assign wr_en[2] = state == RESP & obi_awe_i & (obi_aaddr_i[6:0] == UartTxRegOffset); // Write enable for compare high register
+    assign wr_en[0] = obi_a_fire & obi_awe_i & (obi_aaddr_i[6:0] == UartConfRegOffset); // Needs to ensure write request is valid and handshake occured in address phase
+    assign wr_en[1] = obi_a_fire & obi_awe_i & (obi_aaddr_i[6:0] == UartSpeedRegOffset); // Write enable for compare low register
+    assign wr_en[2] = obi_a_fire & obi_awe_i & (obi_aaddr_i[6:0] == UartTxRegOffset); // Write enable for compare high register
 
     assign write_data_mask = {{8{obi_abe_i[3]}},{8{obi_abe_i[2]}},{8{obi_abe_i[1]}},{8{obi_abe_i[0]}}}; 
 
@@ -142,24 +142,35 @@ module obi_uart #(
     // END: OBI write interface
 
     // BEGIN: OBI read interface
-    assign rd_en = state == RESP & !obi_awe_i ; 
+    assign rd_en = obi_a_fire & !obi_awe_i ; 
 
     assign uart_status_reg = {{31{1'b0}}, tx_empty}; // Indicate if the transmit buffer is empty
 
     always_comb begin 
-        obi_rdata_o = '0; // Default to zero
+        read_data_mux_out = '0; // Default to zero
         if(rd_en) begin
             case(obi_aaddr_i[6:0])
-                UartConfRegOffset: obi_rdata_o = uart_conf_reg;
-                UartSpeedRegOffset: obi_rdata_o = uart_speed_reg;
-                UartTxRegOffset: obi_rdata_o = uart_tx_reg;
-                UartStatusRegOffset: obi_rdata_o = uart_status_reg;
-                default: obi_rdata_o = '0; // Default to zero for unmapped addresses
+                UartConfRegOffset: read_data_mux_out = uart_conf_reg;
+                UartSpeedRegOffset: read_data_mux_out = uart_speed_reg;
+                UartTxRegOffset: read_data_mux_out = uart_tx_reg;
+                UartStatusRegOffset: read_data_mux_out = uart_status_reg;
+                default: read_data_mux_out = '0; // Default to zero for unmapped addresses
             endcase
         end 
     end
 
-
+    // Register to hold the read data during the response phase
+    register  #(
+        .DTYPE(logic [DATA_WIDTH-1:0]),
+        .RESET_VALUE('0)     
+    ) read_data_reg
+        (
+        .clk(clk_i),
+        .rstn(rstn_i),
+        .ce(obi_a_fire), // Capture the read data at the beginning of the response phase
+        .in(read_data_mux_out),
+        .out(obi_rdata_o)
+    );
     // END: logic for OBI read interface
 
     // UART logic
@@ -173,6 +184,7 @@ module obi_uart #(
         .tx(tx_o),
         .tx_done(tx_done)
     );
+
 
     // error handling logic
     always_comb begin 
@@ -188,7 +200,7 @@ module obi_uart #(
 endmodule
 
 // Instantiation template:
-// obi_uart #(
+// obi_uart_v2 #(
 //     .ADDR_WIDTH(32),
 //     .DATA_WIDTH(32)
 // ) obi_uart_v2_inst (
@@ -206,7 +218,6 @@ endmodule
 //     .obi_rerr_o  (),
 //     .tx_o        ()
 // );
-
 
 
 module baud_rate_generator // General Purpose counter        
@@ -423,3 +434,22 @@ endmodule
 
 
 
+// Instantiation template:
+// obi_uart_v2 #(
+//     .ADDR_WIDTH(32),
+//     .DATA_WIDTH(32)
+// ) obi_uart_v2_inst (
+//     .clk_i       (),
+//     .rstn_i      (),
+//     .obi_areq_i  (),
+//     .obi_agnt_o  (),
+//     .obi_aaddr_i (),
+//     .obi_awdata_i(),
+//     .obi_awe_i   (),
+//     .obi_abe_i   (),
+//     .obi_rvalid_o(),
+//     .obi_rready_i(),
+//     .obi_rdata_o (),
+//     .obi_rerr_o  (),
+//     .tx_o        ()
+// );
