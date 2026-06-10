@@ -19,21 +19,28 @@ module obi_uart #(
     output  logic                     obi_rerr_o,
 
     // Output complete
-    output  logic                     tx_o
+    output  logic                     tx_o,
+    input   logic                     rx_i
 );
     
     localparam integer UartConfRegOffset = 0;
     localparam integer UartSpeedRegOffset = 4;
     localparam integer UartTxRegOffset = 8;
-    localparam integer UartStatusRegOffset = 12;
+    localparam integer UartRxRegOffset = 12;
+    localparam integer UartStatusRegOffset = 16;
 
     logic [DATA_WIDTH-1:0] uart_conf_reg;
     logic [DATA_WIDTH-1:0] uart_speed_reg;
     logic [DATA_WIDTH-1:0] uart_tx_reg;
+    logic [DATA_WIDTH-1:0] uart_rx_reg;
     logic [DATA_WIDTH-1:0] uart_status_reg;
 
     logic tx_done;
     logic tx_empty;
+    logic rx_done;
+    logic [7:0] uart_rx_data; // Data received from the UART receiver FSM, 8 bits for one byte of data
+    logic rx_empty;
+    logic rd_reg_en;
 
     // OBI wrapper signals
     typedef enum logic {
@@ -139,12 +146,30 @@ module obi_uart #(
         .rx_empty(tx_empty), 
         .r_out(uart_tx_reg) 
     );
+
+
     // END: OBI write interface
 
     // BEGIN: OBI read interface
     assign rd_en = obi_a_fire & !obi_awe_i ; 
+    assign rd_reg_en = rd_en & (obi_aaddr_i[6:0] == UartRxRegOffset); 
+    
+    
+    
+    interface_circuit #(
+        .DATA_WIDTH(DATA_WIDTH)
+    ) uart_rx_buffer (
+        .clock(clk_i),
+        .reset(~rstn_i),
+        .r_input({{(DATA_WIDTH-8){1'b0}}, uart_rx_data}), 
+        .write_req(rx_done),
+        .read_req(rd_reg_en), 
+        .rx_empty(rx_empty), 
+        .r_out(uart_rx_reg) 
+    );
 
-    assign uart_status_reg = {{31{1'b0}}, tx_empty}; // Indicate if the transmit buffer is empty
+
+    assign uart_status_reg = {{30{1'b0}},!rx_empty, tx_empty}; // Indicate if the transmit buffer is empty
 
     always_comb begin 
         read_data_mux_out = '0; // Default to zero
@@ -153,11 +178,14 @@ module obi_uart #(
                 UartConfRegOffset: read_data_mux_out = uart_conf_reg;
                 UartSpeedRegOffset: read_data_mux_out = uart_speed_reg;
                 UartTxRegOffset: read_data_mux_out = uart_tx_reg;
+                UartRxRegOffset: read_data_mux_out = uart_rx_reg;
                 UartStatusRegOffset: read_data_mux_out = uart_status_reg;
                 default: read_data_mux_out = '0; // Default to zero for unmapped addresses
             endcase
         end 
     end
+
+
 
     // Register to hold the read data during the response phase
     register  #(
@@ -175,14 +203,18 @@ module obi_uart #(
 
     // UART logic
 
-    transmitter_system transmitter_system_inst (
+    uart_system uart_inst (
         .clock(clk_i),
         .reset(~rstn_i),
-        .limit(uart_speed_reg[15:0]), // Use lower 16 bits of the speed register as the baud rate limit
-        .tx_start(uart_conf_reg[0] & !tx_empty), // Start transmission when there is data in the buffer
-        .data_in(uart_tx_reg[7:0]), // Use lower 8 bits of the tx register as the data to transmit
+        .limit(uart_speed_reg), 
+        .tx_start(wr_en[2]), // Start transmission when there is a write to the Tx register
+        .rx_start(1'b1), // Always ready to receive data
+        .data_in(uart_tx_reg[7:0]), // Only the least significant byte is used for transmission
         .tx(tx_o),
-        .tx_done(tx_done)
+        .tx_done(tx_done),
+        .rx(rx_i),
+        .data_out(uart_rx_data), // Capture the received data into uart_rx_data
+        .rx_done(rx_done)
     );
 
 
@@ -191,7 +223,7 @@ module obi_uart #(
         obi_rerr_o = 1'b0; // Default to no error
         if (state == RESP) begin // Only check for read errors during response phase for read transactions
             case(obi_aaddr_i[6:0])
-                UartConfRegOffset, UartSpeedRegOffset, UartTxRegOffset, UartStatusRegOffset: obi_rerr_o = 1'b0; // Valid addresses
+                UartConfRegOffset, UartSpeedRegOffset, UartTxRegOffset, UartStatusRegOffset, UartRxRegOffset: obi_rerr_o = 1'b0; // Valid addresses
                 default: obi_rerr_o = 1'b1; // Invalid address
             endcase
         end
@@ -200,7 +232,7 @@ module obi_uart #(
 endmodule
 
 // Instantiation template:
-// obi_uart_v2 #(
+// obi_uart #(
 //     .ADDR_WIDTH(32),
 //     .DATA_WIDTH(32)
 // ) obi_uart_v2_inst (
@@ -216,240 +248,7 @@ endmodule
 //     .obi_rready_i(),
 //     .obi_rdata_o (),
 //     .obi_rerr_o  (),
-//     .tx_o        ()
+//     .tx_o        (),
+//     .rx_i        ()
 // );
 
-
-module baud_rate_generator // General Purpose counter        
-    #(parameter PRESCALER_WIDTH = 4)
-    (
-        input logic clock,
-        input logic reset,
-        input logic [PRESCALER_WIDTH-1:0] limit,
-        output logic baud_rate_tick
-    );
-
-    logic [PRESCALER_WIDTH-1:0] count;
-
-    // when the counter reaches the limit, the sample_tick signal is generated
-
-    always_ff @(posedge clock) begin
-        if(reset) begin
-            count <= 0;
-        end else begin
-            if(count == limit-1) begin
-                count <= 0;
-            end else begin
-                count <= count + 1;
-            end
-        end
-    end
-
-    assign baud_rate_tick = (count == limit-1);
-endmodule
-
-module uart_fsm #(
-    parameter DATA_WIDTH = 8
-    ) 
-(
-    input logic clock,
-    input logic reset,
-    input logic [DATA_WIDTH-1:0] data_in,
-    input logic baud_rate_tick,
-    input logic tx_start,
-    output logic tx,
-    output logic tx_done,
-    output logic baud_rst // used for baud rate generator reset
-);
-
-    // define the states
-    typedef enum logic [1:0] { // binary encoding
-        IDLE,
-        START,
-        DATA,
-        STOP
-    } state_uart_t;
-    
- 
-    state_uart_t state, next_state;
-
-    // signal declarations 
-    logic [DATA_WIDTH-1:0] b_reg, b_reg_next;
-    logic [3:0] n_counter, n_counter_next; // counter for number of symbols 
-    logic tx_done_next, tx_reg, tx_reg_next;
-
-
-    // state register
-    always_ff @(posedge clock) begin
-        if (reset) begin
-            state <= IDLE;
-            b_reg <= 0;
-            n_counter <= 0;
-            tx_reg <= 1; // idle state state of the tx line
-        end
-        else begin
-            state <= next_state;
-            b_reg <= b_reg_next;
-            n_counter <= n_counter_next;
-            tx_reg <= tx_reg_next;
-        end
-    end
-
-    // state transition logic
-    always_comb begin
-        next_state = state;
-        b_reg_next = b_reg;
-        n_counter_next = n_counter;
-        tx_done = 0;
-        tx_reg_next = tx_reg;
-        baud_rst = 1'b0;
-
-        case (state)
-            IDLE : begin
-                if(tx_start) begin
-                    next_state = START;
-                    b_reg_next = data_in;
-                    baud_rst = 1'b1;
-                end
-            end 
-            START : begin
-                tx_reg_next = 1'b0;
-                if (baud_rate_tick) begin
-                    next_state = DATA;
-                    n_counter_next = 0;
-                end
-            end
-            DATA : begin
-                tx_reg_next = b_reg[0];
-                if (baud_rate_tick) begin
-                    if (n_counter == DATA_WIDTH-1) begin
-                        next_state = STOP;
-                    end
-                    else begin
-                        n_counter_next = n_counter + 1;
-                        b_reg_next = {1'b0, b_reg[7:1]};
-                    end
-                end
-            end
-            STOP : begin
-                tx_reg_next = 1'b1;
-                if (baud_rate_tick) begin
-                    begin
-                        next_state = IDLE;
-                        tx_done= 1'b1;
-                    end
-                end
-            end
-        endcase
-    end
-
-    assign tx = tx_reg;
-endmodule
-
-module transmitter_system(
-    input logic clock,
-    input logic reset,
-    input logic [15:0] limit, 
-    input logic tx_start,
-    input logic [7:0] data_in,
-    output logic tx,
-    output logic tx_done
-);
-
-    logic baud_rate_tick;
-    logic baud_rst;
-    logic local_reset;
-
-    
-    assign local_reset = reset | baud_rst;
-
-    baud_rate_generator #(
-        .PRESCALER_WIDTH(16)
-    ) baud_rate_generator_inst (
-        .clock(clock),
-        .reset(local_reset),
-        .limit(limit),
-        .baud_rate_tick(baud_rate_tick)
-    );
-
-    uart_fsm #(
-        .DATA_WIDTH(8)
-    ) uart_fsm_inst (
-        .clock(clock),
-        .reset(reset),
-        .data_in(data_in),
-        .baud_rate_tick(baud_rate_tick),
-        .tx_start(tx_start),
-        .tx(tx),
-        .tx_done(tx_done),
-        .baud_rst(baud_rst)
-    );
-
-
-endmodule
-
-
-module interface_circuit #(
-    parameter DATA_WIDTH = 8
-) (
-    input logic clock, 
-    input logic reset,
-    input logic [DATA_WIDTH-1:0] r_input, 
-    input logic write_req, // receiving done  
-    input logic read_req, // read uart request 
-    output logic rx_empty,
-    output logic [DATA_WIDTH-1:0] r_out
-);
-    
-    // one word buffer 
-    always_ff @(posedge clock) begin : OneWordBuffer
-        if (reset) begin
-            r_out <= 0;
-        end else begin
-            if (write_req) begin
-                r_out <= r_input;
-            end
-        end
-    end
-
-    // rx_empty signal generation 
-    logic counter;
-
-    always_ff @( posedge clock ) begin : blockName
-        if(reset) begin
-            counter <= 0;
-        end else begin
-            if (write_req) begin
-                counter <= 1; // data is written to the buffer, not empty anymore
-            end else if (read_req) begin
-                counter <= 0; // data is read from the buffer, empty again
-            end
-        end
-    end
-
-    assign rx_empty = counter == 0;
-
-endmodule
-
-
-
-
-// Instantiation template:
-// obi_uart_v2 #(
-//     .ADDR_WIDTH(32),
-//     .DATA_WIDTH(32)
-// ) obi_uart_v2_inst (
-//     .clk_i       (),
-//     .rstn_i      (),
-//     .obi_areq_i  (),
-//     .obi_agnt_o  (),
-//     .obi_aaddr_i (),
-//     .obi_awdata_i(),
-//     .obi_awe_i   (),
-//     .obi_abe_i   (),
-//     .obi_rvalid_o(),
-//     .obi_rready_i(),
-//     .obi_rdata_o (),
-//     .obi_rerr_o  (),
-//     .tx_o        ()
-// );
